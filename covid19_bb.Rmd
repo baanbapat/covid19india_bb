@@ -1,0 +1,394 @@
+---
+title: "Covid-19 India Forecast"
+author: "Baan Bapat"
+date: "26 May 2020"
+output:
+  html_document:
+    theme: cerulean
+    code_folding: hide
+    self_contained: false
+---
+<style>
+h1,h2{page-break-before: always}
+</style>
+
+##### Assumptions
+
+* Models are based on severe lockdown period. 
+* Unfortunately, all indications are for relaxation of lockdown in the coming week and the assumption is already breaking down.
+* Effect(s) of migration unknown.
+
+##### Credits
+
+* Data source: api.covid19india.org
+
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, comment=NA, 
+                      fig.align='center', fig.height=5, fig.width=10) 
+                      # dev.args=list(pointsize=10), out.height="0.5\\paperheight", out.width="0.7\\linewidth")
+options(stringsAsFactors=FALSE, knitr.kable.NA = '', scipen=9)
+library(data.table)
+library(jsonlite)
+library(ggplot2)
+library(plotly)
+
+  #' Get json data from covid19india.org
+df = read_json("https://api.covid19india.org/data.json")
+sf0 = read_json("https://api.covid19india.org/states_daily.json")
+
+```
+
+
+```{r}
+#' Some data points used
+#' rolling windows
+rolldays = 3
+#' Lockdown dates
+lockdowns = as.Date(c('2020-03-25', '2020-04-14', '2020-05-03', 
+                      '2020-05-17', '2020-05-31'))
+#' Start date for model training data
+startdt = lockdowns[3]
+#' How many days ahead forecast
+ahead = 21
+```
+
+```{r}
+cts <- function(){
+  #' extract cases_time_series
+  cases_time_series = rbindlist(df[['cases_time_series']])
+  cases_time_series[, `:=`(
+    date = as.Date(date, '%d %B'),
+    dailyconfirmed = as.integer(dailyconfirmed),
+    dailydeceased = as.integer(dailydeceased),
+    dailyrecovered = as.integer(dailyrecovered),
+    totalconfirmed = as.integer(totalconfirmed),
+    totalrecovered = as.integer(totalrecovered),
+    totaldeceased = as.integer(totaldeceased))]
+  cases_time_series[, `:=`(active = totalconfirmed - totaldeceased - totalrecovered,
+                           fatality = totaldeceased / totalconfirmed * 100)]
+
+  setcolorder(cases_time_series, 'date')
+  #' Daily case rate for total & recovered
+  cases_time_series[, dailyrate := dailyconfirmed/totalconfirmed]
+  cases_time_series[, recovrate := dailyrecovered/totalrecovered]
+  #' Rolling rates of the same two for smoothing
+  cases_time_series[, rollrate := frollmean(dailyrate, n=rolldays)]
+  cases_time_series[, recovrr := frollmean(recovrate, n=rolldays)]
+  #' Doubling rate -- only for confirmed and recovered
+  cases_time_series[, doublingrate := log(2)/log(1 + rollrate)]
+  cases_time_series[, recovdr := log(2)/log(1 + recovrate)]
+  cases_time_series = cases_time_series[date>=lockdowns[1],]
+  return(cases_time_series)
+}
+
+
+  
+
+  #' Overall & State-wise data today's status
+  #' active, confirmed, deaths, deltaconfirmed, deltadeaths, deltarecovered,
+  #' lastupdatedtime, recovered, state
+  statewise = rbindlist(df[['statewise']])
+  # statewise[,1:9]
+  #' Tested
+  tested = rbindlist(df[['tested']])
+
+  #' State case data
+get_sf <- function(){
+  sf = rbindlist(sf0[[1]])
+  sf = melt(sf, id.vars=c('date', 'status'), value.name='cases',
+            variable.name='state')
+  sf[,  `:=`(cases = as.integer(cases),
+             date = as.Date(date, '%d-%b-%y'))]
+  sf[is.na(cases), cases:=0]
+  sf = dcast(sf, date + state ~ status, value.var='cases', fill=0)
+  setorder(sf, 'state', 'date')
+  sf[, `:=`(totalconfirmed = cumsum(Confirmed),
+            totaldeceased = cumsum(Deceased),
+            totalrecovered = cumsum(Recovered)), by='state']
+  sf[, active := totalconfirmed - totalrecovered - totaldeceased]
+  sf[, `:=` (dailyrate  = Confirmed/pmax(totalconfirmed, 1),
+             recovrate  = Recovered/pmax(totalrecovered, 1),
+             fatality = totaldeceased / totalconfirmed * 100)]
+  sf[, `:=`(rollrate = frollmean(dailyrate, n=3),
+            recovrollrate = frollmean(recovrate, n=3)), by='state']
+  sf[, `:=`(doublingrate = log(2)/log(1 + dailyrate),
+            rolldr = log(2)/log(1 + rollrate),
+            recovdr = log(2)/log(1 + recovrollrate))]
+  sf = sf[date>=lockdowns[1] + 6,]
+
+  # Average doubling rate over first week  May
+  dr = sf[date >= Sys.Date() - 7,
+          .(doublingrate =  log(2)/log(1 + mean(dailyrate)),
+            rolldr =  log(2)/log(1 + mean(rollrate)),
+            recovrolldr =  log(2)/log(1 + mean(recovrollrate))),
+          by='state']
+  #' States with highest current active cases
+  topca = sf[date==max(sf$date) - 1, .(state, active, totalconfirmed)]
+  dr = dr[topca, on='state']
+  dr = dr[doublingrate < 20  & active >= 100,]
+  setorder(dr, rolldr)
+  return(list(sf = sf, dr = dr))
+}
+
+
+cases_time_series = cts()
+dtupto = max(cases_time_series$date)
+sfd = get_sf()
+sf = sfd$sf
+dr = sfd$dr
+
+```
+
+
+## All India case count
+
+
+```{r}
+g = ggplot(melt(cases_time_series[, .(date, totalconfirmed, totaldeceased,
+                                      totalrecovered, active)], id.vars='date',
+                value.name='cases', variable.name='series'),
+           aes(x=date, y=cases, col=series)) +
+  geom_line() + 
+  geom_vline(xintercept=lockdowns, col='gray50') +
+  scale_x_date(breaks = scales::breaks_pretty(30)) +
+  scale_y_continuous(trans="log10") +
+  theme(axis.text.x = element_text(angle = 90)) + xlab('Date') +
+  ylab('Total confirmed cases')
+ggplotly(g)
+```
+
+* Plotted on a logarithmic scale
+* Gray lines indicate the lockdown dates
+* Shows a fairly straight line trend in total confirmed, recovered & deceased from the third lockdown (`r format(lockdowns[3], '%d %b %Y')`).
+
+## Fatality
+
+```{r}
+
+ggplot(cases_time_series, aes(x=fatality)) + 
+  geom_histogram(bins=40, col='gray50') + ylab('Count of days')
+```
+
+```{r}
+print(summary(cases_time_series$fatality))
+```
+
+```{r}
+#' Case fatality rate
+cfr = median(cases_time_series$fatality)
+```
+
+* Defining fataility on a cummulative daily basis as $\frac{\text{total deceased}}{\text{total confirmed}}\times 100$.
+* We may consider median fataility  as case fatailty rate (cfr = `r round(cfr,2)`).
+
+## Predicting the next three weeks
+
+* We fit a trend model to log of total confirmed, recovered & deceased.
+* We predict `r ahead` days ahead using all of May data from `r format(lockdowns[3], '%d %b %Y')` up to `r format(dtupto, '%d %b %Y')`
+* Active cases are predicted as difference of confirmed and the other two.
+* Note a marked jump and change of slope in recovered and active cases 16 May onwards. This seems to also make the model fit not so good for these two series. 
+    - Recovery appears to be over predicted and active case count under predicted 
+
+```{r}
+
+#' Fitting regression model to the log of May data using
+pred_jun <- function(trn){
+  trn[, t := 1:.N]
+  pred = data.table(t = 1:(nrow(trn)+ahead),
+                    date = seq(startdt, by=1,
+                               length.out=(nrow(trn)+ahead)))
+  getPred <- function(x){
+    fml = as.formula(paste0("log(", x, ") ~ t"))
+    m1 = lm(fml, trn)
+    print(paste("log", x))
+    print(summary(m1))
+    round(exp(predict(m1, newdata=pred[,"t"])))
+  }
+  pred[, `:=`(pred_cnf = getPred('totalconfirmed'),
+              pred_recv = getPred('totalrecovered'),
+              pred_decd = getPred('totaldeceased'))]
+  pred[, pred_active := pred_cnf - pred_recv - pred_decd]
+  pred[, t := NULL]
+  trn[, t := NULL]
+  pred = rbind(melt(trn, id.vars='date', value.name='cases', variable.name='series'),
+               melt(pred, id.vars='date', value.name='cases', variable.name='series'))
+  pred[, series := factor(series, levels = c(levels(pred$series)[5:8], 
+                                            levels(pred$series)[1:4]))]
+}
+junp = pred_jun(trn = cases_time_series[date>=startdt, 
+                                       .(date, totalconfirmed, totalrecovered,
+                                         totaldeceased, active)])
+```
+
+## Forecast summary (`r ahead` days from `r dtupto`)
+
+```{r}
+cols = c('#c2a5cf', '#a6dba0', '#f4a582', '#92c5de',
+         '#7b3294', '#008837', '#ca0020', '#0571b0')
+g = ggplot(junp, aes(x=date, y=cases, col=series)) + geom_line() +
+  geom_vline(xintercept=lockdowns[3:4], col='gray50') +
+  scale_color_manual(values=cols) +
+  scale_x_date(breaks = scales::breaks_pretty(30)) +
+  theme(axis.text.x = element_text(angle = 90)) + xlab('Date') +
+  ylab('Count of cases')
+ggplotly(g)
+```
+
+* By May-end we expect:
+    - Active cases will be less than recovered
+    - One lakh active cases & Two lakh total cases
+* Three lakh total cases by 7 June
+* Active cases: 1.2 lakh by 9 June
+
+
+## Maharashtra case count
+
+
+```{r}
+g = ggplot(melt(sf[state=='mh', .(date, totalconfirmed, totaldeceased,
+                                      totalrecovered, active)], id.vars='date',
+                value.name='cases', variable.name='series'),
+           aes(x=date, y=cases, col=series)) +
+  geom_line() + 
+  geom_vline(xintercept=lockdowns[-1], col='gray50') +
+  scale_x_date(breaks = scales::breaks_pretty(30)) +
+  scale_y_continuous(trans="log10") +
+  theme(axis.text.x = element_text(angle = 90)) + xlab('Date') +
+  ylab('Total confirmed cases')
+ggplotly(g)
+```
+
+## Maharashtra Fatality
+
+```{r}
+
+ggplot(sf[state=='mh'], aes(x=fatality)) + 
+  geom_histogram(bins=40, col='gray50') + ylab('Count of days')
+```
+
+```{r}
+print(summary(sf[state=='mh',]$fatality))
+```
+
+
+
+```{r}
+#' Case fatality rate
+cfrm = median(sf[state=='mh',]$fatality)
+```
+
+* Maharashtra case fatailty rate (cfrm = `r round(cfrm,2)`).
+
+## Predicting the next three weeks
+
+* We predict `r ahead` days ahead using all of May data from `r format(lockdowns[3] + 6, '%d %b %Y')` up to `r format(dtupto, '%d %b %Y')`
+
+
+```{r}
+junp = pred_jun(trn = sf[state=='mh' & date>=startdt, 
+                                       .(date, totalconfirmed, totalrecovered,
+                                         totaldeceased, active)])
+
+```
+
+## Maharashtra forecast summary (`r ahead` days from `r dtupto`)
+
+```{r}
+cols = c('#c2a5cf', '#a6dba0', '#f4a582', '#92c5de',
+         '#7b3294', '#008837', '#ca0020', '#0571b0')
+g = ggplot(junp, aes(x=date, y=cases, col=series)) + geom_line() +
+  geom_vline(xintercept=lockdowns[3:4], col='gray50') +
+  scale_color_manual(values=cols) +
+  scale_x_date(breaks = scales::breaks_pretty(30)) +
+  theme(axis.text.x = element_text(angle = 90)) + xlab('Date') +
+  ylab('Count of cases')
+ggplotly(g)
+```
+
+* Total cases forecast: 1 lakh by 4 Jun, 1.5 lakh by 11 Jun & 2 lakh by 15 Jun
+* Recovered case count forecast to exceed active case count by 11 Jun
+* Active case count forecast: 50k by 1 Jun, 75k by 11 Jun
+
+## Rest of India (excluding Maharashtra)
+
+
+
+```{r}
+ri = copy(cases_time_series[date >= lockdowns[1] + 6, 
+                            .(date, totalconfirmed, totaldeceased,
+                              totalrecovered, active)])
+ri = ri[sf[state=='mh', ], `:=`(totalconfirmed = totalconfirmed - i.totalconfirmed,
+                                totaldeceased = totaldeceased - i.totaldeceased,
+                                totalrecovered = totalrecovered - i.totalrecovered,
+                                active = active - i.active), on='date']
+ri[, fatality := totaldeceased / totalconfirmed * 100]
+```
+
+
+```{r}
+
+g = ggplot(melt(ri[, .(date, totalconfirmed, totaldeceased,
+                                      totalrecovered, active)], id.vars='date',
+                value.name='cases', variable.name='series'),
+           aes(x=date, y=cases, col=series)) +
+  geom_line() + 
+  geom_vline(xintercept=lockdowns[-1], col='gray50') +
+  scale_x_date(breaks = scales::breaks_pretty(30)) +
+  scale_y_continuous(trans="log10") +
+  theme(axis.text.x = element_text(angle = 90)) + xlab('Date') +
+  ylab('Total confirmed cases')
+ggplotly(g)
+```
+
+## Rest of India Fatality
+
+```{r}
+
+ggplot(ri, aes(x=fatality)) + 
+  geom_histogram(bins=40, col='gray50') + ylab('Count of days')
+```
+
+```{r}
+print(summary(ri$fatality))
+```
+
+
+
+```{r}
+#' Case fatality rate
+cfri = median(sf[state=='mh',]$fatality)
+```
+
+
+* Rest of India case fatailty rate (cfr = `r round(cfri,2)`).
+
+## Predicting the next three weeks
+
+* We predict `r ahead` days ahead using all of May data from `r format(lockdowns[3] + 6, '%d %b %Y')` up to `r format(dtupto, '%d %b %Y')`
+
+
+```{r}
+junp = pred_jun(trn = ri[date>=startdt, .(date, totalconfirmed, totalrecovered,
+                                          totaldeceased, active)])
+```
+
+## Rest of India forecast summary (`r ahead` days from `r dtupto`)
+
+```{r}
+cols = c('#c2a5cf', '#a6dba0', '#f4a582', '#92c5de',
+         '#7b3294', '#008837', '#ca0020', '#0571b0')
+g = ggplot(junp, aes(x=date, y=cases, col=series)) + geom_line() +
+  geom_vline(xintercept=lockdowns[3:4], col='gray50') +
+  scale_color_manual(values=cols) +
+  scale_x_date(breaks = scales::breaks_pretty(30)) +
+  theme(axis.text.x = element_text(angle = 90)) + xlab('Date') +
+  ylab('Count of cases')
+ggplotly(g)
+```
+
+* Total cases forecast: 1.5 lakh by 3 Jun & 2 lakh by 9 Jun
+* Recovered case count has just crossed active case count
+* Active case count forecast to peak at about 51k on 6 Jun, and start dropping thereafter(!)
+
