@@ -7,6 +7,9 @@ output:
     theme: cerulean
     code_folding: hide
     self_contained: false
+params:
+  startdate: '2020-05-01' # Start date for modeling
+  forecastdaysahead: 21 # Number of days ahead forecast
 ---
 <style>
 h1,h2{page-break-before: always}
@@ -17,6 +20,14 @@ h1,h2{page-break-before: always}
 * Models are based on severe lockdown period. 
 * Unfortunately, all indications are for relaxation of lockdown in the coming week and the assumption is already breaking down.
 * Effect(s) of migration unknown.
+* Model used: trend fit to log of cases (confirmed, deceased or recovered).
+* Prediction Error in active cases assumed as sum of error in the three models.
+
+##### Corrections history
+
+* 26 May 2020
+    - CFR for rest of India corrected
+    - Active cases prediction error updated to addition of errors in other models
 
 ##### Credits
 
@@ -33,7 +44,6 @@ library(data.table)
 library(jsonlite)
 library(ggplot2)
 library(plotly)
-library(gridExtra)
 
 #' Get json data from covid19india.org
 df = read_json("https://api.covid19india.org/data.json")
@@ -50,9 +60,9 @@ rolldays = 3
 lockdowns = as.Date(c('2020-03-25', '2020-04-14', '2020-05-03', 
                       '2020-05-17', '2020-05-31'))
 #' Start date for model training data
-startdt = lockdowns[3]
+startdt = as.Date(params$startdate) # lockdowns[3]
 #' How many days ahead forecast
-ahead = 21
+ahead = params$forecastdaysahead # 21
 ```
 
 ```{r}
@@ -221,12 +231,15 @@ pi_jun <- function(trn){
   actv = copy(pred[series=='pred_conf', ])
   actv[, `:=`(cases = cases - 
                 pred[series=='pred_reco',]$cases -
-                pred[series=='pred_dece',]$cases,
-              lwr = lwr - pred[series=='pred_reco',]$lwr -
-                pred[series=='pred_dece',]$lwr,
-              upr = upr - pred[series=='pred_reco',]$upr -
-                pred[series=='pred_dece',]$upr,
+                pred[series=='pred_dece',]$cases)]
+  actv[, `:=`(lwr = cases - (pred[series=='pred_conf',]$cases - pred[series=='pred_conf',]$lwr) -
+                (pred[series=='pred_reco',]$cases - pred[series=='pred_reco',]$lwr) -
+                (pred[series=='pred_dece',]$cases - pred[series=='pred_dece',]$lwr),
+              upr = cases + (pred[series=='pred_conf',]$upr - pred[series=='pred_conf',]$cases) +
+                (pred[series=='pred_reco',]$upr - pred[series=='pred_reco',]$cases) +
+                (pred[series=='pred_dece',]$upr - pred[series=='pred_dece',]$cases),
               series = 'pred_activ')]
+  actv[, `:=`(lwr = pmax(lwr, 0))]
   trn[, t := NULL]
   trn = melt(trn, id.vars='date', value.name='cases', 
                     variable.name='series')
@@ -388,7 +401,7 @@ print(summary(ri$fatality))
 
 ```{r}
 #' Case fatality rate
-cfri = median(sf[state=='mh',]$fatality)
+cfri = median(ri$fatality)
 ```
 
 
@@ -450,19 +463,20 @@ g = ggplot(jp, aes(x=date, y=cases, col=series)) + geom_line() +
   scale_color_manual(values=cols) +
   scale_x_date(breaks = scales::breaks_pretty(6)) +
   facet_wrap(~grp) +
-  theme(axis.text.x = element_text(angle = 90), legend.position="none") +
+  theme(axis.text.x = element_text(angle = 45), legend.position="none") +
   xlab('') + ylab('')
 ggplotly(g)
 ```
 
-```{r}
-smy = data.frame("Feature" = c('Recovered cases more than Active cases', 'Active cases as on 15 Jun', 'Confirmed cases as on 15 Jun',
-                               'When do Active cases peak'),
-                 "India" = c("1 Jun", '1,27,325', '4,57,461', 'Not by 15 Jun'),
-                 "Maharashtra" = c("11 Jun", '85,789', '1,96,027', 'Not by 15 Jun'),
-                 "India Ex. Maha" = c("22 May", '43,016', '2,68,380', '6 Jun (?)'))
-knitr::kable(smy)
-```
+
+| Feature | India | Maharashtra | India Ex. Maha |
+|:-------|-------:|-------:|-------:|
+| Recovered cases more than Active cases | 30 May | 12 Jun | 22 May |
+| Active cases as on 15 Jun | 1,27,325 | 85,789 | 43,016 |
+| Confirmed cases as on 15 Jun | 4,57,461 | 1,96,027 | 2,68,380 |
+| When do Active cases peak | Not by 15 Jun | Not by 15 Jun | 6 Jun (?) |
+| Case fatality rate | 3.2 | 4.23 | 2.73 |
 
 * Forecast based on 1 May - 24 May 2020 data (source: covid19india.org) -- complete lockdown period.
 * Model used: trend fit to log of cases (confirmed, deceased or recovered) -- Lockdown assumption may not be valid in forecast period.
+* Prediction error in active cases assumed as sum of error in the three models.
