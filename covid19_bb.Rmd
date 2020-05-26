@@ -33,8 +33,9 @@ library(data.table)
 library(jsonlite)
 library(ggplot2)
 library(plotly)
+library(gridExtra)
 
-  #' Get json data from covid19india.org
+#' Get json data from covid19india.org
 df = read_json("https://api.covid19india.org/data.json")
 sf0 = read_json("https://api.covid19india.org/states_daily.json")
 
@@ -191,10 +192,11 @@ cfr = median(cases_time_series$fatality)
 * Note a marked jump and change of slope in recovered and active cases 16 May onwards. This seems to also make the model fit not so good for these two series. 
     - Recovery appears to be over predicted and active case count under predicted 
 
-```{r}
 
+
+```{r}
 #' Fitting regression model to the log of May data using
-pred_jun <- function(trn){
+pi_jun <- function(trn){
   trn[, t := 1:.N]
   pred = data.table(t = 1:(nrow(trn)+ahead),
                     date = seq(startdt, by=1,
@@ -204,36 +206,60 @@ pred_jun <- function(trn){
     m1 = lm(fml, trn)
     print(paste("log", x))
     print(summary(m1))
-    round(exp(predict(m1, newdata=pred[,"t"])))
+    pd = predict(m1, newdata=pred[,"t"], 
+                 interval="prediction")
+    pd = as.data.table(apply(pd, 2, function(y) 
+      round(exp(y))))
+    pd$series=paste0('pred_', substr(x, 6, 9))
+    cbind(pred, pd)
   }
-  pred[, `:=`(pred_cnf = getPred('totalconfirmed'),
-              pred_recv = getPred('totalrecovered'),
-              pred_decd = getPred('totaldeceased'))]
-  pred[, pred_active := pred_cnf - pred_recv - pred_decd]
+  pred = rbind(getPred('totalconfirmed'),
+               getPred('totalrecovered'),
+               getPred('totaldeceased'))
   pred[, t := NULL]
+  setnames(pred, 'fit', 'cases')
+  actv = copy(pred[series=='pred_conf', ])
+  actv[, `:=`(cases = cases - 
+                pred[series=='pred_reco',]$cases -
+                pred[series=='pred_dece',]$cases,
+              lwr = lwr - pred[series=='pred_reco',]$lwr -
+                pred[series=='pred_dece',]$lwr,
+              upr = upr - pred[series=='pred_reco',]$upr -
+                pred[series=='pred_dece',]$upr,
+              series = 'pred_activ')]
   trn[, t := NULL]
-  pred = rbind(melt(trn, id.vars='date', value.name='cases', variable.name='series'),
-               melt(pred, id.vars='date', value.name='cases', variable.name='series'))
+  trn = melt(trn, id.vars='date', value.name='cases', 
+                    variable.name='series')
+  trn[, `:=`(lwr = NA, upr = NA)]
+  setcolorder(trn, names(pred))
+  pred = rbind(trn, pred, actv)
   pred[, series := factor(series, levels = c(levels(pred$series)[5:8], 
                                             levels(pred$series)[1:4]))]
 }
-junp = pred_jun(trn = cases_time_series[date>=startdt, 
+jpi = pi_jun(trn = cases_time_series[date>=startdt, 
                                        .(date, totalconfirmed, totalrecovered,
                                          totaldeceased, active)])
 ```
 
-## Forecast summary (`r ahead` days from `r dtupto`)
+## Forecast summary (`r ahead` days from `r format(dtupto, '%d %b %Y')`)
+
 
 ```{r}
 cols = c('#c2a5cf', '#a6dba0', '#f4a582', '#92c5de',
          '#7b3294', '#008837', '#ca0020', '#0571b0')
-g = ggplot(junp, aes(x=date, y=cases, col=series)) + geom_line() +
+legend = jpi[date==max(jpi$date), .(date, series, cases)]
+setorder(legend, 'series')
+legend[, series := c('confirmed', 'recovered', 'deceased', 'active')]
+gi = ggplot(jpi, aes(x=date, y=cases, col=series)) + geom_line() +
   geom_vline(xintercept=lockdowns[3:4], col='gray50') +
+  geom_ribbon(aes(ymin=lwr, ymax=upr, fill=series), alpha=0.2) +
+  geom_text(mapping=aes(label=series, x=date, y=cases, hjust=1, vjust=0),
+            data=legend, col='gray50', nudge_x=-3, nudge_y=1.5) +
   scale_color_manual(values=cols) +
   scale_x_date(breaks = scales::breaks_pretty(30)) +
-  theme(axis.text.x = element_text(angle = 90)) + xlab('Date') +
+  theme(axis.text.x = element_text(angle = 90), legend.position="none") + xlab('Date') +
   ylab('Count of cases')
-ggplotly(g)
+ggplotly(gi)
 ```
 
 * By May-end we expect:
@@ -287,24 +313,28 @@ cfrm = median(sf[state=='mh',]$fatality)
 
 
 ```{r}
-junp = pred_jun(trn = sf[state=='mh' & date>=startdt, 
-                                       .(date, totalconfirmed, totalrecovered,
-                                         totaldeceased, active)])
+junm = pi_jun(trn = sf[state=='mh' & date>=startdt, 
+                       .(date, totalconfirmed, totalrecovered,
+                         totaldeceased, active)])
 
 ```
 
-## Maharashtra forecast summary (`r ahead` days from `r dtupto`)
+## Maharashtra forecast summary (`r ahead` days from `r format(dtupto, '%d %b %Y')`)
 
 ```{r}
-cols = c('#c2a5cf', '#a6dba0', '#f4a582', '#92c5de',
-         '#7b3294', '#008837', '#ca0020', '#0571b0')
-g = ggplot(junp, aes(x=date, y=cases, col=series)) + geom_line() +
+legend = junm[date==max(junm$date), .(date, series, cases)]
+setorder(legend, 'series')
+legend[, series := c('confirmed', 'recovered', 'deceased', 'active')]
+gm = ggplot(junm, aes(x=date, y=cases, col=series)) + geom_line() +
   geom_vline(xintercept=lockdowns[3:4], col='gray50') +
+  geom_ribbon(aes(ymin=lwr, ymax=upr, fill=series), alpha=0.2) +
+  geom_text(mapping=aes(label=series, x=date, y=cases, hjust=1, vjust=0),
+            data=legend, col='gray50', nudge_x=-3, nudge_y=1.5) +
   scale_color_manual(values=cols) +
   scale_x_date(breaks = scales::breaks_pretty(30)) +
-  theme(axis.text.x = element_text(angle = 90)) + xlab('Date') +
+  theme(axis.text.x = element_text(angle = 90), legend.position="none") + xlab('Date') +
   ylab('Count of cases')
-ggplotly(g)
+ggplotly(gm)
 ```
 
 * Total cases forecast: 1 lakh by 4 Jun, 1.5 lakh by 11 Jun & 2 lakh by 15 Jun
@@ -370,25 +400,69 @@ cfri = median(sf[state=='mh',]$fatality)
 
 
 ```{r}
-junp = pred_jun(trn = ri[date>=startdt, .(date, totalconfirmed, totalrecovered,
+jri = pi_jun(trn = ri[date>=startdt, .(date, totalconfirmed, totalrecovered,
                                           totaldeceased, active)])
 ```
 
-## Rest of India forecast summary (`r ahead` days from `r dtupto`)
+## Rest of India forecast summary (`r ahead` days from `r format(dtupto, '%d %b %Y')`)
 
 ```{r}
-cols = c('#c2a5cf', '#a6dba0', '#f4a582', '#92c5de',
-         '#7b3294', '#008837', '#ca0020', '#0571b0')
-g = ggplot(junp, aes(x=date, y=cases, col=series)) + geom_line() +
+legend = jri[date==max(jri$date), .(date, series, cases)]
+setorder(legend, 'series')
+legend[, series := c('confirmed', 'recovered', 'deceased', 'active')]
+gri = ggplot(jri, aes(x=date, y=cases, col=series)) + geom_line() +
   geom_vline(xintercept=lockdowns[3:4], col='gray50') +
+  geom_ribbon(aes(ymin=lwr, ymax=upr, fill=series), alpha=0.2) +
+  geom_text(mapping=aes(label=series, x=date, y=cases, hjust=1, vjust=0),
+            data=legend, col='gray50', nudge_x=-3, nudge_y=1.5) +
   scale_color_manual(values=cols) +
   scale_x_date(breaks = scales::breaks_pretty(30)) +
-  theme(axis.text.x = element_text(angle = 90)) + xlab('Date') +
+  theme(axis.text.x = element_text(angle = 90), legend.position="none") + xlab('Date') +
   ylab('Count of cases')
-ggplotly(g)
+ggplotly(gri)
 ```
 
 * Total cases forecast: 1.5 lakh by 3 Jun & 2 lakh by 9 Jun
 * Recovered case count has just crossed active case count
 * Active case count forecast to peak at about 51k on 6 Jun, and start dropping thereafter(!)
 
+
+```{r}
+jp = rbind(jpi[, grp:='India'],
+           junm[, grp:='Maharashtra'],
+           jri[, grp:='Ind ex. Maha'])
+jp[, grp:=factor(grp, levels=c('India', 'Maharashtra', 'Ind ex. Maha'))]
+```
+
+
+## Forecast Covid-19 trends (May 25-Jun15 2020)
+
+```{r}
+legend = jpi[date==max(jpi$date), .(date, series, cases)]
+setorder(legend, 'series')
+legend[, series := c('confirmed', 'recovered', 'deceased', 'active')]
+legend[, grp:=factor('India', levels=c('India', 'Maharashtra', 'Ind ex. Maha'))]
+g = ggplot(jp, aes(x=date, y=cases, col=series)) + geom_line() +
+  geom_vline(xintercept=lockdowns[3:4], col='gray50') +
+  geom_ribbon(aes(ymin=lwr, ymax=upr, fill=series), alpha=0.2) +
+  geom_text(mapping=aes(label=series, x=date, y=cases, hjust=0, vjust=0),
+            data=legend, col='gray50', nudge_x=-5, nudge_y=1.5) +
+  scale_color_manual(values=cols) +
+  scale_x_date(breaks = scales::breaks_pretty(6)) +
+  facet_wrap(~grp) +
+  theme(axis.text.x = element_text(angle = 90), legend.position="none") +
+  xlab('') + ylab('')
+ggplotly(g)
+```
+
+```{r}
+smy = data.frame("Feature" = c('Recovered cases more than Active cases', 'Active cases as on 15 Jun', 'Confirmed cases as on 15 Jun',
+                               'When do Active cases peak'),
+                 "India" = c("1 Jun", '1,27,325', '4,57,461', 'Not by 15 Jun'),
+                 "Maharashtra" = c("11 Jun", '85,789', '1,96,027', 'Not by 15 Jun'),
+                 "India Ex. Maha" = c("22 May", '43,016', '2,68,380', '6 Jun (?)'))
+knitr::kable(smy)
+```
+
+* Forecast based on 1 May - 24 May 2020 data (source: covid19india.org) -- complete lockdown period.
+* Model used: trend fit to log of cases (confirmed, deceased or recovered) -- Lockdown assumption may not be valid in forecast period.
